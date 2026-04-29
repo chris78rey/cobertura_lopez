@@ -5,9 +5,10 @@ import os
 import re
 import subprocess
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.oracle_jdbc import oracle_connect
 
@@ -326,6 +327,48 @@ def _run_node_pdf_generator(
     }
 
 
+def _crear_zip_coberturas(
+    zip_path: Path,
+    files: list[Path],
+    base_root: Path,
+) -> Path:
+    """
+    Crea un ZIP respetando la estructura de carpetas.
+
+    Ejemplo dentro del ZIP:
+    5827922/CC_01.pdf
+    5827922/CC_02.pdf
+    5827922/CC_03.pdf
+    5827926/CC.pdf
+    """
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    unique_files: list[Path] = []
+    seen: set[str] = set()
+
+    for file_path in files:
+        file_path = file_path.resolve()
+
+        if not file_path.exists():
+            continue
+
+        key = str(file_path)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_files.append(file_path)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in unique_files:
+            arcname = file_path.relative_to(base_root.resolve())
+            zip_file.write(file_path, arcname)
+
+    return zip_path
+
+
 def generar_hojas_cobertura_por_id(
     username: str,
     password: str,
@@ -336,6 +379,8 @@ def generar_hojas_cobertura_por_id(
     single_timeout_seconds: int = 120,
     delay_seconds: float = 2.0,
     max_retries: int = 3,
+    progress_callback: Callable[[int, int, dict[str, str]], None] | None = None,
+    crear_zip: bool = True,
 ) -> dict[str, Any]:
     id_generacion = _validate_id_generacion(id_generacion)
 
@@ -358,6 +403,7 @@ def generar_hojas_cobertura_por_id(
     failed = 0
     folders_created: set[str] = set()
     errors: list[dict[str, str]] = []
+    zip_files: list[Path] = []
 
     with manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -374,11 +420,25 @@ def generar_hojas_cobertura_por_id(
         )
         writer.writeheader()
 
-        for registro in registros:
+        total_registros = len(registros)
+
+        for index, registro in enumerate(registros, start=1):
             planilla = registro["planilla"]
             cedula = registro["cedula"]
             fecha_pdf = registro["fecha_pdf"]
             fecha_texto = registro["fecha_texto"]
+
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total_registros,
+                    {
+                        "planilla": planilla,
+                        "cedula": cedula,
+                        "fecha": fecha_texto,
+                        "estado": "PROCESANDO",
+                    },
+                )
 
             planilla_dir = output_root / _safe_name(planilla)
             planilla_dir.mkdir(parents=True, exist_ok=True)
@@ -389,6 +449,7 @@ def generar_hojas_cobertura_por_id(
 
             if pdf_path.exists() and not overwrite:
                 skipped += 1
+                zip_files.append(pdf_path)
                 writer.writerow(
                     {
                         "planilla": planilla,
@@ -415,6 +476,7 @@ def generar_hojas_cobertura_por_id(
 
             if result["ok"] and pdf_path.exists():
                 generated += 1
+                zip_files.append(pdf_path)
                 writer.writerow(
                     {
                         "planilla": planilla,
@@ -451,6 +513,20 @@ def generar_hojas_cobertura_por_id(
 
             time.sleep(delay_seconds)
 
+    zip_path = None
+
+    if crear_zip:
+        zip_name = f"coberturas_{_safe_name(id_generacion)}_{timestamp}.zip"
+        zip_path_obj = output_root / zip_name
+
+        if zip_files:
+            _crear_zip_coberturas(
+                zip_path=zip_path_obj,
+                files=zip_files,
+                base_root=output_root,
+            )
+            zip_path = str(zip_path_obj)
+
     return {
         "ok": True,
         "id_generacion": id_generacion,
@@ -460,6 +536,7 @@ def generar_hojas_cobertura_por_id(
         "failed": failed,
         "output_root": str(output_root),
         "manifest_path": str(manifest_path),
+        "zip_path": zip_path,
         "folders": sorted(folders_created),
         "errors": errors,
     }

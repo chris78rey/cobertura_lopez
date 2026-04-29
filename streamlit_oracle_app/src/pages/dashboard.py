@@ -199,6 +199,21 @@ def _render_result():
                 use_container_width=True,
             )
 
+    zip_path_value = result.get("zip_path")
+
+    if zip_path_value:
+        zip_path = Path(zip_path_value)
+
+        if zip_path.exists():
+            with zip_path.open("rb") as file:
+                st.download_button(
+                    "Descargar ZIP de coberturas",
+                    data=file,
+                    file_name=zip_path.name,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
     errors = result.get("errors") or []
 
     if errors:
@@ -328,16 +343,40 @@ def dashboard_page():
         if not codigo_limpio:
             st.warning("Ingrese el código de generación.")
         else:
-            submit_job(
-                "Generando hojas de cobertura",
-                generar_hojas_cobertura_por_id,
-                st.session_state.oracle_user,
-                st.session_state.oracle_password,
-                codigo_limpio,
-                overwrite,
-                timeout_seconds=DEFAULT_GENERATE_TIMEOUT_SECONDS,
-            )
-            st.rerun()
+            progress_bar = st.progress(0)
+            status_box = st.empty()
+            detail_box = st.empty()
+
+            def on_progress(done: int, total: int, item: dict[str, str]):
+                percent = int((done / total) * 100) if total else 0
+                progress_bar.progress(percent)
+                status_box.info(
+                    f"Procesando {done} de {total} registros..."
+                )
+                detail_box.write(
+                    f"Planilla: `{item.get('planilla')}` | "
+                    f"Cédula: `{item.get('cedula')}` | "
+                    f"Fecha: `{item.get('fecha')}`"
+                )
+
+            try:
+                with st.spinner("Generando hojas de cobertura..."):
+                    result = generar_hojas_cobertura_por_id(
+                        st.session_state.oracle_user,
+                        st.session_state.oracle_password,
+                        codigo_limpio,
+                        overwrite=overwrite,
+                        progress_callback=on_progress,
+                        crear_zip=True,
+                    )
+
+                st.session_state.current_result = result
+                st.success("Proceso finalizado.")
+                st.rerun()
+
+            except Exception as exc:
+                st.error("No se pudo generar la cobertura.")
+                st.code(str(exc))
 
     if st.session_state.codigo_validado:
         if st.session_state.codigo_encontrado:
