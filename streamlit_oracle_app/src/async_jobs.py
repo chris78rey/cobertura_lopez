@@ -53,7 +53,11 @@ def render_current_job():
         st.info(f"{job_name} en ejecución. La pantalla no está bloqueada.")
         st.caption("Puede presionar 'Actualizar estado' para revisar si ya terminó.")
 
-        if st.button("Actualizar estado", use_container_width=True):
+        if st.button(
+            "Actualizar estado",
+            key="async_job_refresh_button",
+            use_container_width=True,
+        ):
             st.rerun()
 
         return None
