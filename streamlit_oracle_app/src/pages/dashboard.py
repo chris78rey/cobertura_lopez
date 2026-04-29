@@ -1,224 +1,382 @@
 # =========================
 # REEMPLAZAR COMPLETO
 # src/pages/dashboard.py
+# Flujo minimalista:
+# 1. Buscar código
+# 2. Confirmar encontrado
+# 3. Preparar CSV
+# 4. Descargar
 # =========================
+
+from pathlib import Path
 
 import streamlit as st
 
-from src.config import get_default_max_rows
-from src.oracle_jdbc import query_dataframe
 from src.async_jobs import submit_job, render_current_job
-from src.ui import hero, metric_card, badge_ok, badge_warn
+from src.export_planillas import (
+    buscar_id_generacion,
+    export_planillas_csv_no_header,
+)
 
 
-QUERY_TEMPLATES = {
-    "Servidor y usuario actual": """
-SELECT
-    SYSDATE AS FECHA_SERVIDOR,
-    USER AS USUARIO_DB
-FROM DUAL
-""".strip(),
-    "Fecha del servidor": """
-SELECT SYSDATE AS FECHA_SERVIDOR
-FROM DUAL
-""".strip(),
-    "Versión de Oracle": """
-SELECT * 
-FROM PRODUCT_COMPONENT_VERSION
-""".strip(),
-    "Prueba simple": """
-SELECT 1 AS VALOR
-FROM DUAL
-""".strip(),
-    "Consulta libre": "",
-}
+# =========================
+# CONFIGURACIÓN OCULTA
+# =========================
+
+DEFAULT_SEARCH_TIMEOUT_SECONDS = 60
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 600
+DEFAULT_FETCH_SIZE = 5000
+
+
+def _clear_job_state():
+    for key in [
+        "current_future",
+        "current_job_name",
+        "current_result",
+        "current_error",
+        "current_timeout_seconds",
+        "current_started_at_utc",
+        "current_timed_out_ui",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def _clear_search_state():
+    for key in [
+        "codigo_buscado",
+        "codigo_encontrado",
+        "codigo_total_registros",
+        "codigo_validado",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def _init_state():
+    if "codigo_buscado" not in st.session_state:
+        st.session_state.codigo_buscado = ""
+
+    if "codigo_encontrado" not in st.session_state:
+        st.session_state.codigo_encontrado = False
+
+    if "codigo_total_registros" not in st.session_state:
+        st.session_state.codigo_total_registros = 0
+
+    if "codigo_validado" not in st.session_state:
+        st.session_state.codigo_validado = False
+
+
+def _render_minimal_css():
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            max-width: 720px;
+            padding-top: 2.2rem;
+        }
+
+        section[data-testid="stSidebar"] {
+            display: none;
+        }
+
+        .main-title {
+            text-align: center;
+            font-size: 2rem;
+            font-weight: 850;
+            color: #0f172a;
+            margin-bottom: 0.35rem;
+        }
+
+        .main-subtitle {
+            text-align: center;
+            color: #64748b;
+            font-size: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .simple-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 24px;
+            padding: 1.6rem;
+            box-shadow: 0 14px 38px rgba(15, 23, 42, 0.08);
+            margin-bottom: 1.2rem;
+        }
+
+        .status-ok {
+            background: #ecfdf5;
+            border: 1px solid #bbf7d0;
+            color: #166534;
+            border-radius: 18px;
+            padding: 1rem;
+            font-weight: 750;
+            text-align: center;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .status-warn {
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+            color: #9a3412;
+            border-radius: 18px;
+            padding: 1rem;
+            font-weight: 700;
+            text-align: center;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .status-info {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1e3a8a;
+            border-radius: 18px;
+            padding: 1rem;
+            text-align: center;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .status-success {
+            background: #ecfdf5;
+            border: 1px solid #bbf7d0;
+            color: #166534;
+            border-radius: 18px;
+            padding: 1rem;
+            text-align: center;
+            font-weight: 800;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .stTextInput input {
+            font-size: 1.15rem !important;
+            border-radius: 16px !important;
+            padding: 0.85rem !important;
+        }
+
+        .stButton > button {
+            border-radius: 16px !important;
+            font-size: 1.05rem !important;
+            font-weight: 800 !important;
+            padding: 0.85rem 1rem !important;
+        }
+
+        div[data-testid="stDownloadButton"] > button {
+            border-radius: 16px !important;
+            font-size: 1.05rem !important;
+            font-weight: 850 !important;
+            padding: 0.85rem 1rem !important;
+            background-color: #16a34a !important;
+            color: white !important;
+            border: none !important;
+        }
+
+        div[data-testid="stDownloadButton"] > button:hover {
+            background-color: #15803d !important;
+            color: white !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_download_button(result: dict | None):
+    if not result:
+        return
+
+    if not isinstance(result, dict):
+        st.error("No se pudo preparar el archivo generado.")
+        return
+
+    if not result.get("ok"):
+        st.error("No se pudo generar el archivo.")
+        return
+
+    file_path = Path(result["file_path"])
+    file_name = result["file_name"]
+    rows = int(result.get("rows", 0))
+
+    if not file_path.exists():
+        st.error("El archivo generado ya no está disponible. Vuelva a generarlo.")
+        return
+
+    st.markdown(
+        f"""
+        <div class="status-success">
+            Archivo listo para descargar<br>
+            Registros exportados: {rows:,}
+        </div>
+        """.replace(",", "."),
+        unsafe_allow_html=True,
+    )
+
+    with file_path.open("rb") as file:
+        st.download_button(
+            "Descargar CSV",
+            data=file,
+            file_name=file_name,
+            mime="text/csv",
+            key="download_planillas_csv_button",
+            use_container_width=True,
+        )
 
 
 def dashboard_page():
-    hero(
-        "Panel de consultas Oracle 11gR2",
-        "Interfaz ligera, ordenada y preparada para ejecutar consultas en segundo plano sin congelar la pantalla.",
+    _init_state()
+    _render_minimal_css()
+
+    st.markdown(
+        """
+        <div class="main-title">Exportar planillas</div>
+        <div class="main-subtitle">
+            Busque el código de generación y descargue el archivo CSV.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    top_col1, top_col2, top_col3 = st.columns(3)
+    st.markdown('<div class="simple-card">', unsafe_allow_html=True)
 
-    with top_col1:
-        metric_card("Usuario Oracle", str(st.session_state.db_user or "-"))
+    codigo_generacion = st.text_input(
+        "Código de generación",
+        placeholder="Ingrese el código de generación",
+        key="planillas_id_generacion_input",
+    )
 
-    with top_col2:
-        metric_card("Modo de ejecución", "Background")
+    col1, col2 = st.columns([1, 1])
 
-    with top_col3:
-        metric_card("Estado UI", "Estable")
+    with col1:
+        buscar = st.button(
+            "Buscar",
+            key="buscar_codigo_generacion_button",
+            use_container_width=True,
+        )
 
-    st.write("")
+    with col2:
+        preparar_descarga = st.button(
+            "Preparar descarga",
+            key="preparar_descarga_button",
+            use_container_width=True,
+            disabled=not st.session_state.codigo_encontrado,
+        )
 
-    tab1, tab2, tab3 = st.tabs(["Consulta", "Resultado", "Ayuda rápida"])
+    if buscar:
+        _clear_job_state()
+        _clear_search_state()
 
-    with tab1:
-        left, right = st.columns([2.2, 1])
+        codigo_limpio = codigo_generacion.strip()
 
-        with left:
-            st.subheader("Editor de consulta")
+        if not codigo_limpio:
+            st.warning("Ingrese el código de generación.")
+        else:
+            with st.spinner("Buscando código de generación..."):
+                try:
+                    result = buscar_id_generacion(
+                        st.session_state.oracle_user,
+                        st.session_state.oracle_password,
+                        codigo_limpio,
+                        DEFAULT_SEARCH_TIMEOUT_SECONDS,
+                    )
 
-            template_name = st.selectbox(
-                "Plantilla",
-                list(QUERY_TEMPLATES.keys()),
-                index=0,
+                    st.session_state.codigo_buscado = codigo_limpio
+                    st.session_state.codigo_validado = True
+                    st.session_state.codigo_encontrado = bool(result["found"])
+                    st.session_state.codigo_total_registros = int(result["rows"])
+
+                    st.rerun()
+
+                except Exception as exc:
+                    st.session_state.codigo_validado = False
+                    st.session_state.codigo_encontrado = False
+                    st.session_state.codigo_total_registros = 0
+                    st.error("No se pudo realizar la búsqueda.")
+                    st.code(str(exc))
+
+    if st.session_state.codigo_validado:
+        if st.session_state.codigo_encontrado:
+            st.markdown(
+                f"""
+                <div class="status-ok">
+                    Código encontrado<br>
+                    Registros disponibles: {st.session_state.codigo_total_registros:,}
+                </div>
+                """.replace(",", "."),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div class="status-warn">
+                    No se encontraron registros para ese código.
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-            template_sql = QUERY_TEMPLATES[template_name]
+    if preparar_descarga:
+        _clear_job_state()
 
-            if "sql_editor_value" not in st.session_state:
-                st.session_state.sql_editor_value = template_sql
+        submit_job(
+            "Preparación del archivo CSV",
+            export_planillas_csv_no_header,
+            st.session_state.oracle_user,
+            st.session_state.oracle_password,
+            st.session_state.codigo_buscado,
+            DEFAULT_EXPORT_TIMEOUT_SECONDS,
+            DEFAULT_FETCH_SIZE,
+            timeout_seconds=DEFAULT_EXPORT_TIMEOUT_SECONDS,
+        )
 
-            if template_sql and st.session_state.get("last_template") != template_name:
-                st.session_state.sql_editor_value = template_sql
-                st.session_state.last_template = template_name
+        st.rerun()
 
-            sql = st.text_area(
-                "SQL",
-                key="sql_editor_value",
-                height=260,
-                placeholder="Escriba aquí su consulta SQL...",
-            )
+    future = st.session_state.get("current_future")
 
-        with right:
-            st.subheader("Parámetros")
-            max_rows = st.number_input(
-                "Máximo de filas",
-                min_value=1,
-                max_value=100000,
-                value=get_default_max_rows(),
-                step=100,
-            )
-
-            st.markdown("### Estado actual")
-            future = st.session_state.get("current_future")
-
-            if future is None:
-                badge_warn("Sin proceso activo")
-            else:
-                if future.running():
-                    badge_warn("Consulta en ejecución")
-                elif future.done():
-                    badge_ok("Última consulta finalizada")
-                else:
-                    badge_warn("Estado no determinado")
-
-            st.write("")
-            st.caption(
-                "Sugerencia: para producción, limitar las consultas libres y ofrecer solo plantillas controladas."
-            )
-
-        btn1, btn2, btn3 = st.columns([1, 1, 1])
-
-        with btn1:
-            run_query = st.button(
-                "Ejecutar consulta",
-                key="dashboard_run_query_button",
-                use_container_width=True,
-            )
-
-        with btn2:
-            refresh_status = st.button(
-                "Actualizar estado",
-                key="dashboard_refresh_status_button",
-                use_container_width=True,
-            )
-
-        with btn3:
-            clear_result = st.button(
-                "Limpiar resultado",
-                key="dashboard_clear_result_button",
-                use_container_width=True,
-            )
-
-        if run_query:
-            if not sql.strip():
-                st.warning("Debe ingresar una consulta SQL.")
-            else:
-                submit_job(
-                    "Consulta Oracle",
-                    query_dataframe,
-                    st.session_state.oracle_user,
-                    st.session_state.oracle_password,
-                    sql,
-                    None,
-                    int(max_rows),
-                )
-                st.rerun()
-
-        if refresh_status:
-            st.rerun()
-
-        if clear_result:
-            for key in [
-                "current_future",
-                "current_job_name",
-                "current_result",
-                "current_error",
-            ]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
-
-    with tab2:
-        st.subheader("Resultado de la ejecución")
+    if future:
+        st.markdown(
+            """
+            <div class="status-info">
+                Preparando archivo. La pantalla seguirá activa mientras finaliza el proceso.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         result = render_current_job()
 
         if result is None:
             result = st.session_state.get("current_result")
 
-        if result is not None:
-            rows_count = len(result.index)
-            cols_count = len(result.columns)
+        _render_download_button(result)
 
-            c1, c2, c3 = st.columns(3)
+    current_error = st.session_state.get("current_error")
 
-            with c1:
-                metric_card("Filas", str(rows_count))
+    if current_error:
+        st.error("No se pudo preparar el archivo.")
+        with st.expander("Ver detalle técnico"):
+            st.code(current_error)
 
-            with c2:
-                metric_card("Columnas", str(cols_count))
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            with c3:
-                metric_card("Exportación", "CSV")
+    st.write("")
 
-            st.write("")
-            st.dataframe(result, use_container_width=True, height=460)
+    if st.button(
+        "Salir",
+        key="minimal_logout_button",
+        use_container_width=True,
+    ):
+        st.session_state.auth_ok = False
+        st.session_state.oracle_user = None
+        st.session_state.oracle_password = None
+        st.session_state.db_user = None
+        _clear_job_state()
+        _clear_search_state()
+        st.rerun()
 
-            csv = result.to_csv(index=False).encode("utf-8-sig")
 
-            st.download_button(
-                "Descargar CSV",
-                data=csv,
-                file_name="resultado_oracle.csv",
-                mime="text/csv",
-                use_container_width=False,
-            )
-        else:
-            st.info("Aún no hay resultados para mostrar.")
-
-            current_error = st.session_state.get("current_error")
-            if current_error:
-                st.error("La última consulta terminó con error.")
-                st.code(current_error)
-
-    with tab3:
-        st.subheader("Ayuda rápida")
-        st.markdown(
-            """
-            **Buenas prácticas recomendadas**
-            - Empiece con consultas pequeñas.
-            - Use límite de filas para evitar cargas innecesarias.
-            - Prefiera plantillas predefinidas en usuarios finales.
-            - Si la consulta tarda, use **Actualizar estado** en lugar de repetir el envío.
-
-            **Notas**
-            - La app valida credenciales directamente contra Oracle.
-            - La ejecución corre en segundo plano para reducir riesgo de freeze.
-            - La conexión RAC sigue usando failover manual.
-            """
-        )
+# =========================
+# FIN
+# =========================

@@ -27,7 +27,7 @@ def login_screen():
         """
         <div class="ux-login-shell">
             <div class="ux-login-card">
-                <div class="ux-login-title">Oracle Streamlit App</div>
+                <div class="ux-login-title">Sistema de Consulta Oracle</div>
                 <div class="ux-login-subtitle">
                     Ingreso con credenciales de base de datos Oracle
                 </div>
@@ -84,7 +84,7 @@ def login_screen():
 
 def logout_button():
     with st.sidebar:
-        st.markdown("## 🗄️ Oracle Streamlit App")
+        st.markdown("## 🗄️ Consulta Oracle")
         st.caption("Interfaz ligera para consulta y trabajo rápido")
 
         st.markdown("---")

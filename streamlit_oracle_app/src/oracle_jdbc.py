@@ -1,5 +1,5 @@
 # =========================
-# NUEVO: conexión Oracle JDBC con failover manual
+# ORACLE JDBC CON FAILOVER + TIMEOUT DEFENSIVO
 # =========================
 
 from __future__ import annotations
@@ -55,7 +55,6 @@ def oracle_connect(username: str, password: str):
 def test_login(username: str, password: str) -> dict:
     """
     Valida las credenciales contra Oracle.
-    Si conecta y ejecuta SELECT 1 FROM DUAL, el login es correcto.
     """
 
     conn = None
@@ -88,46 +87,125 @@ def test_login(username: str, password: str) -> dict:
                 pass
 
 
+def _java_resultset_to_dataframe(result_set) -> pd.DataFrame:
+    """
+    Convierte un ResultSet JDBC Java a pandas DataFrame.
+
+    Se usa JDBC directo para poder aplicar:
+    - statement.setQueryTimeout()
+    - statement.setMaxRows()
+    """
+
+    metadata = result_set.getMetaData()
+    column_count = metadata.getColumnCount()
+
+    columns = []
+
+    for idx in range(1, column_count + 1):
+        label = metadata.getColumnLabel(idx)
+        columns.append(str(label))
+
+    rows = []
+
+    while result_set.next():
+        row = []
+
+        for idx in range(1, column_count + 1):
+            value = result_set.getObject(idx)
+
+            if value is None:
+                row.append(None)
+            else:
+                row.append(str(value))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def query_dataframe(
     username: str,
     password: str,
     sql: str,
     params: list | tuple | None = None,
     max_rows: int = 500,
+    timeout_seconds: int = 30,
 ) -> pd.DataFrame:
     """
-    Ejecuta una consulta y devuelve DataFrame.
+    Ejecuta una consulta SELECT con timeout defensivo.
 
     Protección:
     - Abre conexión nueva por consulta.
     - Cierra conexión al finalizar.
-    - Aplica límite defensivo de filas envolviendo la consulta.
+    - Aplica límite máximo de filas.
+    - Aplica timeout JDBC real mediante setQueryTimeout.
     """
 
+    if params:
+        raise RuntimeError(
+            "Esta versión con timeout JDBC directo no acepta parámetros todavía. "
+            "Use SQL controlado desde plantillas."
+        )
+
+    clean_sql = sql.strip().rstrip(";")
+
+    if not clean_sql.lower().startswith("select"):
+        raise RuntimeError("Por seguridad, solo se permiten consultas SELECT.")
+
     conn = None
+    statement = None
+    result_set = None
 
     safe_sql = f"""
         SELECT *
         FROM (
-            {sql}
+            {clean_sql}
         )
         WHERE ROWNUM <= {int(max_rows)}
     """
 
     try:
         conn = oracle_connect(username, password)
-        cursor = conn.cursor()
 
-        cursor.execute(safe_sql, params or [])
+        # Acceso a la conexión Java real que JayDeBeApi envuelve.
+        java_conn = conn.jconn
 
-        columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
+        statement = java_conn.createStatement()
 
-        cursor.close()
+        # Timeout real de consulta a nivel JDBC.
+        statement.setQueryTimeout(int(timeout_seconds))
 
-        return pd.DataFrame(rows, columns=columns)
+        # Límite adicional defensivo a nivel JDBC.
+        statement.setMaxRows(int(max_rows))
+
+        result_set = statement.executeQuery(safe_sql)
+
+        return _java_resultset_to_dataframe(result_set)
+
+    except Exception as exc:
+        message = str(exc)
+
+        if "ORA-01013" in message or "cancel" in message.lower() or "timeout" in message.lower():
+            raise RuntimeError(
+                f"La consulta superó el timeout configurado de {timeout_seconds} segundos "
+                "y fue cancelada o interrumpida por el driver JDBC."
+            ) from exc
+
+        raise
 
     finally:
+        if result_set:
+            try:
+                result_set.close()
+            except Exception:
+                pass
+
+        if statement:
+            try:
+                statement.close()
+            except Exception:
+                pass
+
         if conn:
             try:
                 conn.close()
@@ -135,5 +213,5 @@ def query_dataframe(
                 pass
 
 # =========================
-# FIN NUEVO
+# FIN
 # =========================

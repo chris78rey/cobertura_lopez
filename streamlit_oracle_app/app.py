@@ -11,10 +11,11 @@ from src.ui import inject_global_css
 
 
 st.set_page_config(
-    page_title="Oracle Streamlit App",
+    page_title="Sistema de Consulta Oracle",
     page_icon="🗄️",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={},
 )
 
 

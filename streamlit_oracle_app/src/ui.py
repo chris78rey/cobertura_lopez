@@ -201,6 +201,14 @@ def inject_global_css():
             margin-top: 0.9rem !important;
             margin-bottom: 0.9rem !important;
         }
+
+        /* ===== Ocultar marca Streamlit ===== */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        .stAppToolbar {display: none !important;}
+        div[data-testid="stDecoration"] {display: none !important;}
+        section[data-testid="stSidebar"] > div:first-child > div:first-child {height: 100%;}
         </style>
         """,
         unsafe_allow_html=True,
