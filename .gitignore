@@ -1,0 +1,13 @@
+# Entorno virtual
+.venv/
+
+# Configuración local con credenciales
+.env
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
