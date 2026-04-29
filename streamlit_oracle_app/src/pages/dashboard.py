@@ -62,8 +62,7 @@ def _reset_all():
     _clear_job_state()
     _clear_search_state()
 
-    if "planillas_id_generacion_input" in st.session_state:
-        del st.session_state["planillas_id_generacion_input"]
+    st.session_state.input_reset_counter += 1
 
 
 def _init_state():
@@ -73,6 +72,7 @@ def _init_state():
         "codigo_total_registros": 0,
         "codigo_validado": False,
         "archivo_listo": False,
+        "input_reset_counter": 0,
     }
 
     for key, value in defaults.items():
