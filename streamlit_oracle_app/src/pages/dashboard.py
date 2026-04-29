@@ -1,34 +1,17 @@
-# =========================
-# REEMPLAZAR COMPLETO
-# src/pages/dashboard.py
-#
-# Flujo final minimalista:
-# 1. Ingresar código de generación
-# 2. Buscar
-# 3. Si existe, genera CSV automáticamente
-# 4. Descargar se activa cuando el archivo está listo
-# 5. Limpiar permite ingresar otro código
-# =========================
-
 from pathlib import Path
 import time
 
 import streamlit as st
 
 from src.async_jobs import submit_job, render_current_job
-from src.export_planillas import (
-    buscar_id_generacion,
-    export_planillas_csv_no_header,
+from src.cobertura_pdf import (
+    contar_registros_cobertura,
+    generar_hojas_cobertura_por_id,
 )
 
 
-# =========================
-# CONFIGURACIÓN OCULTA PARA USUARIO FINAL
-# =========================
-
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 60
-DEFAULT_EXPORT_TIMEOUT_SECONDS = 600
-DEFAULT_FETCH_SIZE = 5000
+DEFAULT_GENERATE_TIMEOUT_SECONDS = 3600
 AUTO_REFRESH_SECONDS = 2
 
 
@@ -52,7 +35,6 @@ def _clear_search_state():
         "codigo_encontrado",
         "codigo_total_registros",
         "codigo_validado",
-        "archivo_listo",
     ]:
         if key in st.session_state:
             del st.session_state[key]
@@ -61,7 +43,6 @@ def _clear_search_state():
 def _reset_all():
     _clear_job_state()
     _clear_search_state()
-
     st.session_state.input_reset_counter += 1
 
 
@@ -71,7 +52,6 @@ def _init_state():
         "codigo_encontrado": False,
         "codigo_total_registros": 0,
         "codigo_validado": False,
-        "archivo_listo": False,
         "input_reset_counter": 0,
     }
 
@@ -80,13 +60,13 @@ def _init_state():
             st.session_state[key] = value
 
 
-def _render_minimal_css():
+def _render_css():
     st.markdown(
         """
         <style>
         .block-container {
-            max-width: 700px;
-            padding-top: 2.2rem;
+            max-width: 760px;
+            padding-top: 2rem;
         }
 
         section[data-testid="stSidebar"] {
@@ -141,18 +121,6 @@ def _render_minimal_css():
             margin-bottom: 1rem;
         }
 
-        .status-info {
-            background: #eff6ff;
-            border: 1px solid #bfdbfe;
-            color: #1e3a8a;
-            border-radius: 18px;
-            padding: 1rem;
-            font-weight: 700;
-            text-align: center;
-            margin-top: 1rem;
-            margin-bottom: 1rem;
-        }
-
         .status-success {
             background: #ecfdf5;
             border: 1px solid #bbf7d0;
@@ -177,30 +145,6 @@ def _render_minimal_css():
             font-weight: 850 !important;
             padding: 0.85rem 1rem !important;
         }
-
-        div[data-testid="stDownloadButton"] > button {
-            border-radius: 16px !important;
-            font-size: 1.05rem !important;
-            font-weight: 850 !important;
-            padding: 0.85rem 1rem !important;
-        }
-
-        div[data-testid="stDownloadButton"] > button:not(:disabled) {
-            background-color: #16a34a !important;
-            color: white !important;
-            border: none !important;
-        }
-
-        div[data-testid="stDownloadButton"] > button:not(:disabled):hover {
-            background-color: #15803d !important;
-            color: white !important;
-        }
-
-        div[data-testid="stDownloadButton"] > button:disabled {
-            background-color: #e2e8f0 !important;
-            color: #64748b !important;
-            border: 1px solid #cbd5e1 !important;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -219,54 +163,53 @@ def _get_ready_result() -> dict | None:
     if not result.get("ok"):
         return None
 
-    file_path = Path(result.get("file_path", ""))
-
-    if not file_path.exists():
-        return None
-
     return result
 
 
-def _render_download_button():
+def _render_result():
     result = _get_ready_result()
 
     if not result:
-        st.download_button(
-            "Descargar CSV",
-            data=b"",
-            file_name="planillas.csv",
-            mime="text/csv",
-            key="download_planillas_csv_button_disabled",
-            use_container_width=True,
-            disabled=True,
-        )
         return
-
-    file_path = Path(result["file_path"])
-    file_name = result["file_name"]
-    rows = int(result.get("rows", 0))
-
-    st.session_state.archivo_listo = True
 
     st.markdown(
         f"""
         <div class="status-success">
-            Archivo listo para descargar<br>
-            Registros exportados: {rows:,}
+            Proceso finalizado<br>
+            Total: {result.get("total", 0)} |
+            Generados: {result.get("generated", 0)} |
+            Omitidos: {result.get("skipped", 0)} |
+            Errores: {result.get("failed", 0)}
         </div>
-        """.replace(",", "."),
+        """,
         unsafe_allow_html=True,
     )
 
-    with file_path.open("rb") as file:
-        st.download_button(
-            "Descargar CSV",
-            data=file,
-            file_name=file_name,
-            mime="text/csv",
-            key="download_planillas_csv_button_ready",
-            use_container_width=True,
-        )
+    st.info(f"Carpeta principal: {result.get('output_root')}")
+
+    manifest_path = Path(result.get("manifest_path", ""))
+
+    if manifest_path.exists():
+        with manifest_path.open("rb") as file:
+            st.download_button(
+                "Descargar manifiesto CSV",
+                data=file,
+                file_name=manifest_path.name,
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    errors = result.get("errors") or []
+
+    if errors:
+        with st.expander("Ver errores"):
+            for item in errors:
+                st.write(
+                    f"Planilla: `{item.get('planilla')}` | "
+                    f"Cédula: `{item.get('cedula')}` | "
+                    f"Fecha: `{item.get('fecha')}`"
+                )
+                st.code(item.get("error", ""))
 
 
 def _auto_refresh_if_running():
@@ -279,13 +222,14 @@ def _auto_refresh_if_running():
 
 def dashboard_page():
     _init_state()
-    _render_minimal_css()
+    _render_css()
 
     st.markdown(
         """
-        <div class="main-title">Exportar planillas</div>
+        <div class="main-title">Generar hojas de cobertura</div>
         <div class="main-subtitle">
-            Ingrese el código de generación y descargue el archivo CSV.
+            Ingrese el código de generación. El sistema creará una carpeta por planilla
+            y guardará dentro la hoja de cobertura de cada cédula.
         </div>
         """,
         unsafe_allow_html=True,
@@ -295,31 +239,45 @@ def dashboard_page():
 
     future = st.session_state.get("current_future")
     proceso_en_ejecucion = bool(future and future.running())
-    archivo_listo = _get_ready_result() is not None
+    resultado_listo = _get_ready_result() is not None
 
-    input_key = f"planillas_id_generacion_input_{st.session_state.input_reset_counter}"
+    input_key = f"cobertura_id_generacion_input_{st.session_state.input_reset_counter}"
 
     codigo_generacion = st.text_input(
         "Código de generación",
-        placeholder="Ingrese el código de generación",
+        placeholder="Ejemplo: 12345",
         key=input_key,
         disabled=proceso_en_ejecucion,
     )
 
-    col1, col2 = st.columns([1, 1])
+    overwrite = st.checkbox(
+        "Sobrescribir PDFs si ya existen",
+        value=False,
+        disabled=proceso_en_ejecucion,
+    )
+
+    col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
         buscar = st.button(
             "Buscar",
-            key="buscar_codigo_generacion_button",
+            key="buscar_coberturas_button",
             use_container_width=True,
-            disabled=proceso_en_ejecucion or archivo_listo,
+            disabled=proceso_en_ejecucion,
         )
 
     with col2:
+        generar = st.button(
+            "Generar PDFs",
+            key="generar_coberturas_button",
+            use_container_width=True,
+            disabled=proceso_en_ejecucion or resultado_listo,
+        )
+
+    with col3:
         limpiar = st.button(
             "Limpiar",
-            key="limpiar_codigo_generacion_button",
+            key="limpiar_coberturas_button",
             use_container_width=True,
         )
 
@@ -336,9 +294,9 @@ def dashboard_page():
         if not codigo_limpio:
             st.warning("Ingrese el código de generación.")
         else:
-            with st.spinner("Buscando código de generación..."):
+            with st.spinner("Buscando registros en Oracle..."):
                 try:
-                    search_result = buscar_id_generacion(
+                    search_result = contar_registros_cobertura(
                         st.session_state.oracle_user,
                         st.session_state.oracle_password,
                         codigo_limpio,
@@ -353,18 +311,6 @@ def dashboard_page():
                     st.session_state.codigo_encontrado = encontrado
                     st.session_state.codigo_total_registros = total
 
-                    if encontrado:
-                        submit_job(
-                            "Preparando archivo CSV",
-                            export_planillas_csv_no_header,
-                            st.session_state.oracle_user,
-                            st.session_state.oracle_password,
-                            codigo_limpio,
-                            DEFAULT_EXPORT_TIMEOUT_SECONDS,
-                            DEFAULT_FETCH_SIZE,
-                            timeout_seconds=DEFAULT_EXPORT_TIMEOUT_SECONDS,
-                        )
-
                     st.rerun()
 
                 except Exception as exc:
@@ -374,15 +320,34 @@ def dashboard_page():
                     st.error("No se pudo realizar la búsqueda.")
                     st.code(str(exc))
 
+    if generar:
+        _clear_job_state()
+
+        codigo_limpio = codigo_generacion.strip()
+
+        if not codigo_limpio:
+            st.warning("Ingrese el código de generación.")
+        else:
+            submit_job(
+                "Generando hojas de cobertura",
+                generar_hojas_cobertura_por_id,
+                st.session_state.oracle_user,
+                st.session_state.oracle_password,
+                codigo_limpio,
+                overwrite,
+                timeout_seconds=DEFAULT_GENERATE_TIMEOUT_SECONDS,
+            )
+            st.rerun()
+
     if st.session_state.codigo_validado:
         if st.session_state.codigo_encontrado:
             st.markdown(
                 f"""
                 <div class="status-ok">
                     Código encontrado<br>
-                    Registros disponibles: {st.session_state.codigo_total_registros:,}
+                    Registros disponibles: {st.session_state.codigo_total_registros}
                 </div>
-                """.replace(",", "."),
+                """,
                 unsafe_allow_html=True,
             )
         else:
@@ -396,29 +361,16 @@ def dashboard_page():
             )
 
     if future:
-        if future.running():
-            st.markdown(
-                """
-                <div class="status-info">
-                    Preparando archivo. La pantalla sigue activa.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        result = render_current_job()
-
-        if result is None:
-            result = st.session_state.get("current_result")
+        render_current_job()
 
     current_error = st.session_state.get("current_error")
 
     if current_error:
-        st.error("No se pudo preparar el archivo.")
+        st.error("No se pudo generar la cobertura.")
         with st.expander("Ver detalle técnico"):
             st.code(current_error)
 
-    _render_download_button()
+    _render_result()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -437,8 +389,3 @@ def dashboard_page():
         st.rerun()
 
     _auto_refresh_if_running()
-
-
-# =========================
-# FIN
-# =========================
